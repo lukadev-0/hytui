@@ -2,14 +2,21 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_executor::Executor;
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use http::{Method, Request};
+use http_body_util::BodyExt;
 use hyper::Uri;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Layout, Offset, Rect, Spacing};
+use ratatui::style::{Color, Style};
+use ratatui::symbols::merge::MergeStrategy;
+use ratatui::text::Text;
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
-use ratatui_textarea::TextArea;
 
-use hytui::http_client;
+use crate::text_field::{TextField, TextFieldState};
+
+mod http_client;
+mod text_field;
 
 fn main() -> Result<()> {
     let ex = Arc::new(Executor::new());
@@ -48,18 +55,62 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-pub struct App {
+struct App {
     ex: Arc<Executor<'static>>,
     msg_sender: async_channel::Sender<Result<Message>>,
     running: bool,
-    url: TextArea<'static>,
+    focus: Focus,
+    url: TextFieldState,
+    body: TextFieldState,
     response: String,
+    method_idx: usize,
 }
 
-pub enum Message {
+enum Message {
     Input(Event),
     Response(String),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Focus {
+    Method,
+    URL,
+    Headers,
+    Body,
+    Response,
+}
+
+impl Focus {
+    const ALL: &[Self] = &[
+        Self::Method,
+        Self::URL,
+        Self::Headers,
+        Self::Body,
+        Self::Response,
+    ];
+}
+
+const ALL_METHODS: &[Method] = &[
+    Method::GET,
+    Method::POST,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+    Method::QUERY,
+    Method::HEAD,
+    Method::OPTIONS,
+];
+
+const METHOD_COLORS: &[Color] = &[
+    Color::Blue,
+    Color::Green,
+    Color::Yellow,
+    Color::Indexed(214),
+    Color::Red,
+    Color::Cyan,
+    Color::Indexed(147),
+    Color::Magenta,
+];
 
 impl App {
     fn new(ex: Arc<Executor<'static>>, msg_sender: async_channel::Sender<Result<Message>>) -> Self {
@@ -67,8 +118,11 @@ impl App {
             ex,
             msg_sender,
             running: true,
-            url: TextArea::default(),
+            focus: Focus::Method,
+            url: TextFieldState::new(),
+            body: TextFieldState::new(),
             response: String::new(),
+            method_idx: 0,
         }
     }
 
@@ -85,24 +139,65 @@ impl App {
         if let Event::Key(key_event) = event
             && event.is_key_press()
         {
+            let has_ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
             match key_event.code {
-                KeyCode::Char('c') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('c') if has_ctrl => {
                     self.running = false;
                 }
-                KeyCode::Enter => {
+                KeyCode::Tab => self.focus_next(),
+                KeyCode::BackTab => self.focus_prev(),
+                KeyCode::Enter | KeyCode::Char('j') if has_ctrl => {
                     self.handle_submit();
                 }
-                _ => {
-                    self.url.input(key_event);
-                }
+                _ => match self.focus {
+                    Focus::Method => self.handle_key_method(key_event),
+                    Focus::URL => self.handle_key_url(key_event),
+                    Focus::Headers => {}
+                    Focus::Body => self.body.handle_input(key_event),
+                    Focus::Response => {}
+                },
             }
         }
     }
 
-    fn handle_submit(&mut self) {
-        self.response = String::from("Sending...");
+    fn focus_prev(&mut self) {
+        let mut focus_index = self.focus as usize;
+        focus_index = focus_index.checked_sub(1).unwrap_or(Focus::ALL.len() - 1);
+        self.focus = Focus::ALL[focus_index];
+    }
 
-        let mut url = self.url.lines().first().cloned().unwrap_or_default();
+    fn focus_next(&mut self) {
+        let mut focus_index = self.focus as usize;
+        focus_index = (focus_index + 1) % Focus::ALL.len();
+        self.focus = Focus::ALL[focus_index];
+    }
+
+    fn handle_key_method(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Up => {
+                self.method_idx = self
+                    .method_idx
+                    .checked_sub(1)
+                    .unwrap_or(ALL_METHODS.len() - 1);
+            }
+            KeyCode::Down => {
+                self.method_idx = (self.method_idx + 1) % ALL_METHODS.len();
+            }
+            KeyCode::Enter => self.focus_next(),
+            _ => {}
+        }
+    }
+
+    fn handle_key_url(&mut self, key_event: KeyEvent) {
+        if key_event.code == KeyCode::Enter {
+            self.focus_next();
+        } else {
+            self.url.handle_input(key_event);
+        }
+    }
+
+    fn handle_submit(&mut self) {
+        let mut url = self.url.text.to_string();
         if url.is_empty() {
             return;
         }
@@ -119,41 +214,135 @@ impl App {
         };
 
         self.url.clear();
-        self.url.insert_str(url.to_string());
+        self.url.insert_str(&url.to_string());
+
+        let req = match Request::builder()
+            .uri(url)
+            .method(&ALL_METHODS[self.method_idx])
+            .body(
+                self.body
+                    .text
+                    .to_string()
+                    .map_err(anyhow::Error::new)
+                    .boxed(),
+            ) {
+            Ok(req) => req,
+            Err(err) => {
+                self.response = err.to_string();
+                return;
+            }
+        };
+
+        self.response = String::from("Sending...");
 
         let msg_sender = self.msg_sender.clone();
         self.ex
             .spawn(async move {
-                let res = match http_client::request(&url).await {
-                    Ok(res) => res,
-                    Err(err) => format!("{err:?}"),
-                };
+                let res = http_client::request(req, async |res| {
+                    let collected = res.collect().await.context("failed to collect response")?;
+                    Ok(String::from_utf8_lossy(&collected.to_bytes()).into_owned())
+                })
+                .await
+                .unwrap_or_else(|err| format!("{err:?}"));
                 _ = msg_sender.send(Ok(Message::Response(res))).await;
             })
             .detach();
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let layout = Layout::new(
-            Direction::Vertical,
-            [Constraint::Length(3), Constraint::Fill(1)],
-        )
-        .split(frame.area());
+        let layout =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).split(frame.area());
 
-        self.url.set_block(
+        self.render_request(frame, layout[0]);
+        self.render_response(frame, layout[1]);
+    }
+
+    fn border_style(&mut self, focus: Focus) -> Style {
+        let mut style = Style::new();
+        if self.focus == focus {
+            style = style.blue();
+        }
+        style
+    }
+
+    fn render_request(&mut self, frame: &mut Frame, area: Rect) {
+        let layout = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+
+        self.render_request_url(frame, layout[0]);
+
+        frame.render_widget(
             Block::bordered()
+                .border_style(self.border_style(Focus::Headers))
                 .border_type(BorderType::Rounded)
-                .title("URL"),
+                .title("Headers"),
+            layout[1],
         );
-        frame.render_widget(&self.url, layout[0]);
 
+        self.render_request_body(frame, layout[2]);
+    }
+
+    fn render_request_url(&mut self, frame: &mut Frame, area: Rect) {
+        let method = &ALL_METHODS[self.method_idx];
+        let method_color = METHOD_COLORS[self.method_idx];
+
+        let layout = Layout::horizontal([Constraint::Length(11), Constraint::Fill(1)])
+            .spacing(Spacing::Overlap(1))
+            .split(area);
+
+        frame.render_widget(
+            Paragraph::new(Text::from(method.as_str()).style(method_color))
+                .centered()
+                .block(
+                    Block::bordered()
+                        .border_style(self.border_style(Focus::Method))
+                        .border_type(BorderType::Rounded)
+                        .merge_borders(MergeStrategy::Fuzzy),
+                ),
+            layout[0],
+        );
+
+        let url_block = Block::bordered()
+            .border_style(self.border_style(Focus::URL))
+            .border_type(BorderType::Rounded)
+            .merge_borders(MergeStrategy::Fuzzy)
+            .title("URL");
+        let url_inner = url_block.inner(layout[1]);
+
+        frame.render_widget(&url_block, layout[1]);
+        frame.render_stateful_widget(TextField::new(), url_inner, &mut self.url);
+        if self.focus == Focus::URL {
+            frame.set_cursor_position(url_inner.as_position() + self.url.cursor_offset());
+        }
+    }
+
+    fn render_request_body(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered()
+            .border_style(self.border_style(Focus::Body))
+            .border_type(BorderType::Rounded)
+            .title("Body");
+        let inner = block.inner(area);
+        frame.render_widget(&block, area);
+        frame.render_stateful_widget(TextField::new(), inner, &mut self.body);
+        if self.focus == Focus::Body {
+            frame.set_cursor_position(inner.as_position() + self.body.cursor_offset());
+        }
+    }
+
+    fn render_response(&mut self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .border_style(self.border_style(Focus::Response))
             .border_type(BorderType::Rounded)
             .title("Response");
-        frame.render_widget(&block, layout[1]);
         frame.render_widget(
-            Paragraph::new(self.response.as_str()).wrap(Wrap { trim: false }),
-            block.inner(layout[1]),
+            Paragraph::new(self.response.as_str())
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
         )
     }
 }

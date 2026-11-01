@@ -9,89 +9,38 @@ use bytes::Bytes;
 use futures_lite::{AsyncRead, AsyncWrite, future};
 use futures_rustls::TlsConnector;
 use futures_rustls::rustls::ClientConfig;
-use http::Response;
-use http::uri::Scheme;
+use http::header;
+use http::uri::{Scheme, Uri};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
-use hyper::{Request, Uri};
 use pin_project_lite::pin_project;
 use rustls_platform_verifier::BuilderVerifierExt;
 
-pin_project! {
-    struct FuturesIo<T> {
-        #[pin]
-        inner: T,
-    }
-}
+pub type Body = BoxBody<Bytes, anyhow::Error>;
+pub type Request = hyper::Request<Body>;
+pub type Response = hyper::Response<Incoming>;
 
-impl<T: AsyncRead> hyper::rt::Read for FuturesIo<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> task::Poll<Result<(), IoError>> {
-        let this = self.project();
-        let b = buf.initialize_unfilled();
-        let n = task::ready!(this.inner.poll_read(cx, b))?;
-        // SAFETY: we just initialized it.
-        unsafe { buf.advance(n) };
-        task::Poll::Ready(Ok(()))
-    }
-}
+pub async fn request<R>(
+    mut req: Request,
+    response_cb: impl AsyncFnOnce(Response) -> Result<R>,
+) -> Result<R> {
+    let (send_request, conn) = connect(req.uri()).await.context("could not connect")?;
 
-impl<T: AsyncWrite> hyper::rt::Write for FuturesIo<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        buf: &[u8],
-    ) -> task::Poll<Result<usize, std::io::Error>> {
-        self.project().inner.poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> task::Poll<Result<(), std::io::Error>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> task::Poll<Result<(), std::io::Error>> {
-        self.project().inner.poll_close(cx)
-    }
-}
-
-pub async fn request(url: &Uri) -> Result<String> {
-    let (send_request, conn) = connect(url).await.context("could not connect")?;
-
-    let req = Request::builder()
-        .uri(url)
-        .header(hyper::header::HOST, url_host(url)?)
-        .header(hyper::header::USER_AGENT, "hytui")
-        .body(Empty::<Bytes>::new().map_err(anyhow::Error::new).boxed())
-        .context("could not construct request")?;
+    let host = url_host(req.uri())?
+        .parse()
+        .context("invalid HOST header")?;
+    req.headers_mut().append(header::HOST, host);
 
     let (res, conn_res) = future::zip(
         async move {
-            let res = (send_request)(req)
-                .await
-                .context("failed to send request")?;
-
-            let collected = String::from_utf8_lossy(
-                &res.into_body()
-                    .collect()
+            response_cb(
+                (send_request)(req)
                     .await
-                    .context("could not collect body")?
-                    .to_bytes(),
+                    .context("failed to send request")?,
             )
-            .into_owned();
-
-            anyhow::Ok(collected)
+            .await
         },
-        conn,
+        async move { conn.await.context("connection errored") },
     )
     .await;
     let () = conn_res?;
@@ -119,12 +68,9 @@ async fn connect(url: &Uri) -> Result<(SendRequest, Connection)> {
     }
 }
 
-type Body = BoxBody<Bytes, anyhow::Error>;
 type Connection = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-type SendRequest = Box<
-    dyn FnOnce(Request<Body>) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>>> + Send>>
-        + Send,
->;
+type SendRequest =
+    Box<dyn FnOnce(Request) -> Pin<Box<dyn Future<Output = Result<Response>> + Send>> + Send>;
 
 async fn connect_http(url: &Uri) -> Result<(SendRequest, Connection)> {
     let stream = connect_tcp(url, 80).await?;
@@ -176,6 +122,52 @@ async fn connect_h1(
         Box::new(move |req| {
             Box::pin(async move { sender.send_request(req).await.map_err(anyhow::Error::new) })
         }),
-        Box::pin(async move { conn.await.context("connection errored") }),
+        Box::pin(async move { conn.await.map_err(anyhow::Error::new) }),
     ))
+}
+
+pin_project! {
+    struct FuturesIo<T> {
+        #[pin]
+        inner: T,
+    }
+}
+
+impl<T: AsyncRead> hyper::rt::Read for FuturesIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> task::Poll<Result<(), IoError>> {
+        let this = self.project();
+        let b = buf.initialize_unfilled();
+        let n = task::ready!(this.inner.poll_read(cx, b))?;
+        // SAFETY: we just initialized it.
+        unsafe { buf.advance(n) };
+        task::Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: AsyncWrite> hyper::rt::Write for FuturesIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> task::Poll<Result<usize, std::io::Error>> {
+        self.project().inner.poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<Result<(), std::io::Error>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<Result<(), std::io::Error>> {
+        self.project().inner.poll_close(cx)
+    }
 }
