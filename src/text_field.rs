@@ -12,9 +12,11 @@ pub use gap_string::GapString;
 
 pub struct TextFieldState {
     pub text: GapString,
-    pub cursor_col: u32,
-    pub cursor_row: u32,
+    pub cursor_col: u16,
+    pub cursor_row: u16,
     pub cursor_idx: usize,
+    pub scroll_x: u16,
+    pub scroll_y: u16,
 }
 
 impl TextFieldState {
@@ -23,7 +25,10 @@ impl TextFieldState {
     }
 
     pub fn cursor_offset(&self) -> Offset {
-        Offset::new(self.cursor_col as i32, self.cursor_row as i32)
+        Offset::new(
+            (self.cursor_col - self.scroll_x) as i32,
+            (self.cursor_row - self.scroll_y) as i32,
+        )
     }
 
     pub fn handle_input(&mut self, key_event: KeyEvent) {
@@ -57,11 +62,11 @@ impl TextFieldState {
                 if grapheme.is_empty() || grapheme.contains('\n') {
                     break;
                 }
-                self.cursor_col += grapheme.cell_width() as u32;
+                self.cursor_col += grapheme.cell_width();
                 grapheme.clear();
             }
         } else {
-            self.cursor_col -= grapheme.cell_width() as u32;
+            self.cursor_col -= grapheme.cell_width();
         }
     }
 
@@ -105,7 +110,7 @@ impl TextFieldState {
             self.cursor_row += 1;
             self.cursor_col = 0;
         } else {
-            self.cursor_col += grapheme.cell_width() as u32;
+            self.cursor_col += grapheme.cell_width();
         }
     }
 
@@ -147,6 +152,8 @@ impl From<String> for TextFieldState {
             cursor_col: 0,
             cursor_row: 0,
             cursor_idx: 0,
+            scroll_x: 0,
+            scroll_y: 0,
         }
     }
 }
@@ -164,12 +171,25 @@ impl StatefulWidget for TextField {
     type State = TextFieldState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
-        let mut x = area.x;
-        let mut y = area.y;
+        if state.cursor_row < state.scroll_y {
+            state.scroll_y = state.cursor_row;
+        }
+        if state.cursor_row >= state.scroll_y + area.height {
+            state.scroll_y = state.cursor_row - area.height + 1;
+        }
+        if state.cursor_col < state.scroll_x {
+            state.scroll_x = state.cursor_col
+        }
+        if state.cursor_col >= state.scroll_x + area.width {
+            state.scroll_x = state.cursor_col - area.width + 1
+        }
+
+        let mut x = 0;
+        let mut y = 0;
 
         let mut graphemes = state.text.graphemes(..);
         let mut grapheme = String::new();
-        while y < area.bottom() {
+        while y < state.scroll_y + area.height {
             grapheme.clear();
             graphemes.read_next(&mut grapheme);
             if grapheme.is_empty() {
@@ -177,11 +197,17 @@ impl StatefulWidget for TextField {
             }
 
             if grapheme.contains('\n') {
-                x = area.x;
+                x = 0;
                 y += 1;
             } else {
-                if x < area.right() {
-                    buf.cell_mut((x, y)).unwrap().set_symbol(&grapheme);
+                if x >= state.scroll_x && y >= state.scroll_y {
+                    let cell_x = area.x + x - state.scroll_x;
+                    let cell_y = area.y + y - state.scroll_y;
+                    if cell_x < area.right() {
+                        buf.cell_mut((cell_x, cell_y))
+                            .unwrap()
+                            .set_symbol(&grapheme);
+                    }
                 }
                 x += grapheme.cell_width();
             }
