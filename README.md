@@ -8,7 +8,7 @@ Download a binary for your platform from the [Releases][releases].
 
 ### Build from source
 
-To build HyTUI from source, you need to install the [Rust toolchain](install-rust).
+To build HyTUI from source, you need to install the [Rust toolchain][install-rust].
 Afterwards, clone this repository, and run the following command to build the program:
 
 ```sh
