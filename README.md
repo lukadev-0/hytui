@@ -2,6 +2,8 @@
 
 A HTTP client in a TUI.
 
+![screenshot](./.github/screenshot.png)
+
 The TUI is built using the [Ratatui][ratatui] library. For HTTP we use [hyper][hyper].
 For TLS, which is used for HTTPS, we use [rustls](https://github.com/rustls/rustls).
 We use the [smol][smol] family of crates for the async stuff!
